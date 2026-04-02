@@ -136,7 +136,7 @@ class MissionManager(QObject):
                 data = json.load(f)
             self._waypoints = data.get("waypoints", [])
             for wp in self._waypoints:
-                self._mqtt.publish("/uav/control", {"waypoint": wp})
+                self._mqtt.publish("/clientUAV/control", {"waypoint": wp})
             print(f"[MISSION] Loaded & sent {len(self._waypoints)} waypoints")
             QMessageBox.information(
                 parent_widget, "Mission Loaded",
@@ -164,13 +164,13 @@ class MQTTHandler(QObject):
 
     # Individual telemetry topics → dict key
     TELE_TOPICS = {
-        "/uav/lat":      "lat",
-        "/uav/lng":      "lng",
-        "/uav/velocity": "velocity",
-        "/uav/altitude": "altitude",
-        "/uav/mode":     "mode",
-        "/uav/battery":  "battery",
-        "/uav/signal":   "signal",
+        "/clientUAV/x_pos":      "lat",
+        "/clientUAV/u_pos":      "lng",
+        "/clientUAV/velocity": "velocity",
+        "/clientUAV/altitude": "altitude",
+        "/clientUAV/mode":     "mode",
+        "/clientUAV/soc":  "battery",
+        "/clientUAV/signal":   "signal",
     }
 
     def __init__(self):
@@ -213,8 +213,8 @@ class MQTTHandler(QObject):
             # Subscribe to each telemetry field topic individually
             for topic in self.TELE_TOPICS:
                 client.subscribe(topic, qos=1)
-            client.subscribe("/uav/image",    qos=1)
-            client.subscribe("/uav/failsafe", qos=1)
+            client.subscribe("/clientUAV/image",    qos=1)
+            client.subscribe("/clientUAV/failsafe", qos=1)
             self.connection_signal.emit(True)
         else:
             print(f"[MQTT] Connect refused: {reason_code}")
@@ -251,7 +251,7 @@ class MQTTHandler(QObject):
                 print(f"[MQTT] Telemetry parse error ({topic}): {e}")
 
         # ── Failsafe ──────────────────────────────────────
-        elif topic == "/uav/failsafe":
+        elif topic == "/clientUAV/failsafe":
             try:
                 self.failsafe_signal.emit(msg.payload.decode().strip())
             except RuntimeError:
@@ -260,7 +260,7 @@ class MQTTHandler(QObject):
                 print(f"[MQTT] Failsafe parse error: {e}")
 
         # ── Binary image frame ───────────────────────────
-        elif topic == "/uav/image":
+        elif topic == "/clientUAV/image":
             try:
                 img_no, chunk_no, total, payload = self._decode_frame(msg.payload)
 
@@ -833,23 +833,23 @@ class DroneGCS(QMainWindow):
     def set_mode(self, mode: str):
         """User clicked a mode button — update UI AND publish command to drone."""
         self._apply_mode(mode)
-        self.mqtt.publish("/uav/control", {"mode": mode})
+        self.mqtt.publish("/clientUAV/control", {"mode": mode})
 
     def send_control(self, direction: str):
-        self.mqtt.publish("/uav/control", {"move": direction})
+        self.mqtt.publish("/clientUAV/control", {"move": direction})
 
     def toggle_mission(self):
         if not hasattr(self, '_running'):
             self._running = False
         self._running = not self._running
         if self._running:
-            self.mqtt.publish("/uav/control", {"command": "START"})
+            self.mqtt.publish("/clientUAV/control", {"command": "START"})
             self._startstop_btn.setText("⏹   STOP")
             self._startstop_btn.setObjectName("StopBtn")
             self._status_lbl.setText(f"DRONE STATUS:  {self._current_mode}")
             self._status_lbl.setStyleSheet("")
         else:
-            self.mqtt.publish("/uav/control", {"command": "STOP"})
+            self.mqtt.publish("/clientUAV/control", {"command": "STOP"})
             self._startstop_btn.setText("▶   START")
             self._startstop_btn.setObjectName("StartBtn")
             self._status_lbl.setText("⏹  STOPPED")
