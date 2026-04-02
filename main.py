@@ -1,4 +1,7 @@
-import sys, json, base64, threading, math, csv, time, os, argparse
+import sys, json, threading, math, csv, time, os
+
+# Binary image frame delimiter (3 bytes) — separates header fields
+FRAME_DELIM = b'\xAA\xBB\xCC'
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -11,7 +14,7 @@ from PyQt6.QtGui import (
 import paho.mqtt.client as mqtt
 
 # ═══════════════════════════════════════════════════════════
-#  TELEMETRY PROCESSOR
+#  DATA LOGGER
 # ═══════════════════════════════════════════════════════════
 
 class TelemetryProcessor(QObject):
@@ -158,19 +161,31 @@ class MQTTHandler(QObject):
     BROKER = "test.mosquitto.org"
     PORT   = 1883
 
+    # Individual telemetry topics → dict key
+    TELE_TOPICS = {
+        "/uav/lat":      "lat",
+        "/uav/lng":      "lng",
+        "/uav/velocity": "velocity",
+        "/uav/altitude": "altitude",
+        "/uav/mode":     "mode",
+        "/uav/battery":  "battery",
+        "/uav/signal":   "signal",
+    }
+
     def __init__(self):
         super().__init__()
-        self.connected  = False
+        self.connected   = False
+        self._tele_state: dict = {}              # accumulated per-field telemetry
         self._chunks: dict[int, dict[int, bytes]] = {}
-        self._chunk_times: dict[int, float] = {}   # img_no → first-chunk time
-        self._CHUNK_TIMEOUT = 60.0                 # seconds
+        self._chunk_times: dict[int, float] = {} # img_no → first-chunk timestamp
+        self._CHUNK_TIMEOUT = 60.0               # seconds before incomplete image discarded
 
         self._build_client()
 
-        # Chunk-timeout watchdog — fires every 3 s
+        # Chunk-timeout watchdog — fires every 5 s
         self._watchdog = QTimer()
         self._watchdog.timeout.connect(self._expire_chunks)
-        self._watchdog.start(3000)
+        self._watchdog.start(5000)
 
     def _build_client(self):
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -194,8 +209,10 @@ class MQTTHandler(QObject):
         if reason_code == 0:
             self.connected = True
             print("[MQTT] Connected")
-            client.subscribe("/uav/telemetry", qos=1)
-            client.subscribe("/uav/image",     qos=1)
+            # Subscribe to each telemetry field topic individually
+            for topic in self.TELE_TOPICS:
+                client.subscribe(topic, qos=1)
+            client.subscribe("/uav/image", qos=1)
             self.connection_signal.emit(True)
         else:
             print(f"[MQTT] Connect refused: {reason_code}")
@@ -205,29 +222,42 @@ class MQTTHandler(QObject):
         print(f"[MQTT] Disconnected ({reason_code}). Auto-reconnect active…")
         self.connection_signal.emit(False)
 
+    @staticmethod
+    def _decode_frame(raw: bytes):
+        """Parse binary image frame: DELIM|img_no|DELIM|chunk_no|DELIM|total|DELIM|payload"""
+        parts = raw.split(FRAME_DELIM, 4)
+        if len(parts) != 5 or parts[0] != b'':
+            raise ValueError(f"Bad frame structure ({len(parts)} parts)")
+        img_no     = int.from_bytes(parts[1], 'big')
+        chunk_no   = int.from_bytes(parts[2], 'big')
+        total_size = int.from_bytes(parts[3], 'big')
+        payload    = parts[4]
+        return img_no, chunk_no, total_size, payload
+
     def _on_message(self, client, userdata, msg):
         topic = msg.topic
 
-        if topic == "/uav/telemetry":
+        # ── Per-field telemetry ──────────────────────────
+        if topic in self.TELE_TOPICS:
             try:
-                self.telemetry_signal.emit(json.loads(msg.payload.decode()))
+                key = self.TELE_TOPICS[topic]
+                self._tele_state[key] = msg.payload.decode().strip()
+                self.telemetry_signal.emit(dict(self._tele_state))
             except RuntimeError:
-                pass   # app shutting down — Qt object already deleted
+                pass
             except Exception as e:
-                print(f"[MQTT] Telemetry parse error: {e}")
+                print(f"[MQTT] Telemetry parse error ({topic}): {e}")
 
+        # ── Binary image frame ───────────────────────────
         elif topic == "/uav/image":
             try:
-                data     = json.loads(msg.payload.decode())
-                img_no   = data["img_no"]
-                chunk_no = data["chunk_no"]
-                total    = data["total_img_size"]
+                img_no, chunk_no, total, payload = self._decode_frame(msg.payload)
 
                 if img_no not in self._chunks:
                     self._chunks[img_no]      = {}
                     self._chunk_times[img_no] = time.monotonic()
 
-                self._chunks[img_no][chunk_no] = base64.b64decode(data["payload"])
+                self._chunks[img_no][chunk_no] = payload
 
                 assembled = b"".join(
                     self._chunks[img_no][k] for k in sorted(self._chunks[img_no])
@@ -236,8 +266,9 @@ class MQTTHandler(QObject):
                     self.image_signal.emit(assembled)
                     del self._chunks[img_no]
                     del self._chunk_times[img_no]
+                    print(f"[MQTT] Image {img_no} assembled ({total} bytes)")
             except Exception as e:
-                print(f"[MQTT] Image chunk error: {e}")
+                print(f"[MQTT] Image frame error: {e}")
 
     def _expire_chunks(self):
         now     = time.monotonic()
@@ -423,7 +454,7 @@ class DroneGCS(QMainWindow):
         self.mqtt    = MQTTHandler()
         self.tele_p  = TelemetryProcessor()
         self.logger  = DataLogger()
-        self.mission = MissionManager(self.mqtt)
+        self._last_pixmap: QPixmap | None = None   # for SAVE button
 
         # ── Signals ────────────────────────────────────────
         self.mqtt.telemetry_signal.connect(self._on_telemetry)
@@ -516,10 +547,6 @@ class DroneGCS(QMainWindow):
         self._dpad = DPadWidget()
         self._dpad.directionPressed.connect(self.send_control)
         v.addWidget(self._dpad, 0, Qt.AlignmentFlag.AlignCenter)
-        v.addWidget(self._separator())
-        self._view_btn = QPushButton("◉  CAMERA VIEW")
-        self._view_btn.setObjectName("ViewBtn"); self._view_btn.setCheckable(True)
-        v.addWidget(self._view_btn)
         v.addStretch()
         return panel
 
@@ -591,18 +618,20 @@ class DroneGCS(QMainWindow):
         v.addLayout(sgr)
         v.addWidget(self._separator())
 
-        v.addWidget(self._section_title("MISSION"))
-        self._btn_load = QPushButton("⬆  LOAD"); self._btn_load.setObjectName("ActionBtn")
-        self._btn_save = QPushButton("⬇  SAVE"); self._btn_save.setObjectName("ActionBtn")
-        self._btn_load.clicked.connect(lambda: self.mission.load(self))
-        self._btn_save.clicked.connect(lambda: self.mission.save(self))
+        v.addWidget(self._section_title("IMAGE"))
+        self._btn_load = QPushButton("📂  LOAD IMG"); self._btn_load.setObjectName("ActionBtn")
+        self._btn_save = QPushButton("💾  SAVE IMG"); self._btn_save.setObjectName("ActionBtn")
+        self._btn_load.clicked.connect(self._load_image_file)
+        self._btn_save.clicked.connect(self._save_image_file)
         v.addWidget(self._btn_load); v.addWidget(self._btn_save)
         v.addStretch()
 
         v.addWidget(self._separator())
-        self._stop_btn = QPushButton("⛔  STOP"); self._stop_btn.setObjectName("StopBtn")
-        self._stop_btn.clicked.connect(self.emergency_stop)
-        self._stop_btn.setFixedHeight(52); v.addWidget(self._stop_btn)
+        self._startstop_btn = QPushButton("▶   START")
+        self._startstop_btn.setObjectName("StartBtn")
+        self._startstop_btn.clicked.connect(self.toggle_mission)
+        self._startstop_btn.setFixedHeight(52)
+        v.addWidget(self._startstop_btn)
         return panel
 
     def _build_statusbar(self):
@@ -660,11 +689,10 @@ class DroneGCS(QMainWindow):
             labels = {0:"NONE",1:"WEAK",2:"POOR",3:"FAIR",4:"GOOD",5:"STRONG"}
             self._sig_label.setText(labels.get(s, str(s)))
         if mode:
-            self.set_mode(mode)
+            self._apply_mode(mode)   # UI only — no re-publish
 
         # Feed telemetry processor & logger
         self.tele_p.process(x, y)
-        self.mission.add_waypoint(x, y, float(alt) if alt is not None else 0.0)
         self.logger.log(data)
 
     def _on_stats(self, dist_m: float, area_m2: float):
@@ -674,6 +702,7 @@ class DroneGCS(QMainWindow):
     def _on_image(self, image_bytes: bytes):
         px = QPixmap()
         px.loadFromData(image_bytes)
+        self._last_pixmap = px
         self._img_area.setPixmap(
             px.scaled(
                 self._img_area.width(), self._img_area.height(),
@@ -682,25 +711,86 @@ class DroneGCS(QMainWindow):
             )
         )
 
+    def _load_image_file(self):
+        """Open a local image file and display it in the image viewer."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif)"
+        )
+        if not path:
+            return
+        px = QPixmap(path)
+        if px.isNull():
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Load Error", f"Could not load image:\n{path}")
+            return
+        self._last_pixmap = px
+        self._img_area.setPixmap(
+            px.scaled(
+                self._img_area.width(), self._img_area.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+        )
+        print(f"[IMG] Loaded: {path}")
+
+    def _save_image_file(self):
+        """Save the currently displayed image to a file."""
+        if self._last_pixmap is None or self._last_pixmap.isNull():
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Nothing to Save", "No image is currently displayed.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Image", "drone_image.png",
+            "PNG Image (*.png);;JPEG Image (*.jpg)"
+        )
+        if not path:
+            return
+        if self._last_pixmap.save(path):
+            print(f"[IMG] Saved: {path}")
+        else:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Save Error", f"Could not save to:\n{path}")
+
     def _tick_clock(self):
         self._time_lbl.setText(datetime.now().strftime("%H:%M:%S IST"))
 
     # ── Controls ───────────────────────────────────────────
-    def set_mode(self, mode: str):
+    def _apply_mode(self, mode: str):
+        """Update mode UI only — does NOT publish to MQTT (used for incoming telemetry)."""
         self._current_mode = mode
         for m, btn in self._mode_btns.items():
             btn.setChecked(m == mode)
         self._status_lbl.setText(f"DRONE STATUS:  {mode}")
         self._status_lbl.setStyleSheet("")
+
+    def set_mode(self, mode: str):
+        """User clicked a mode button — update UI AND publish command to drone."""
+        self._apply_mode(mode)
         self.mqtt.publish("/uav/control", {"mode": mode})
 
     def send_control(self, direction: str):
         self.mqtt.publish("/uav/control", {"move": direction})
 
-    def emergency_stop(self):
-        self.mqtt.publish("/uav/control", {"command": "STOP"})
-        self._status_lbl.setText("⛔  EMERGENCY STOP")
-        self._status_lbl.setStyleSheet("color: #FF4444;")
+    def toggle_mission(self):
+        if not hasattr(self, '_running'):
+            self._running = False
+        self._running = not self._running
+        if self._running:
+            self.mqtt.publish("/uav/control", {"command": "START"})
+            self._startstop_btn.setText("⏹   STOP")
+            self._startstop_btn.setObjectName("StopBtn")
+            self._status_lbl.setText(f"DRONE STATUS:  {self._current_mode}")
+            self._status_lbl.setStyleSheet("")
+        else:
+            self.mqtt.publish("/uav/control", {"command": "STOP"})
+            self._startstop_btn.setText("▶   START")
+            self._startstop_btn.setObjectName("StartBtn")
+            self._status_lbl.setText("⏹  STOPPED")
+            self._status_lbl.setStyleSheet("color: #FF4444;")
+        # Force stylesheet refresh after objectName change
+        self._startstop_btn.style().unpolish(self._startstop_btn)
+        self._startstop_btn.style().polish(self._startstop_btn)
 
     # ── Stylesheet ─────────────────────────────────────────
     def apply_global_styles(self):
@@ -742,6 +832,13 @@ class DroneGCS(QMainWindow):
 #StatVal  { color: #C0D8F0; font-size: 12px; font-weight: bold; }
 #ActionBtn { background-color: #0D1828; color: #3070A0; border: 1px solid #1a3050; border-radius: 8px; padding: 8px; font-size: 11px; font-weight: bold; }
 #ActionBtn:hover { background-color: #0A2035; color: #00D4FF; border-color: #00D4FF; }
+#StartBtn {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #00451a,stop:1 #002610);
+    color: #00FF88; border: 2px solid #00CC66; border-radius: 10px;
+    font-size: 14px; font-weight: bold; letter-spacing: 2px;
+}
+#StartBtn:hover   { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #006628,stop:1 #003815); color: #44FFaa; }
+#StartBtn:pressed { background-color: #008833; }
 #StopBtn {
     background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #6B0000,stop:1 #3D0000);
     color: #FF4444; border: 2px solid #FF2222; border-radius: 10px;

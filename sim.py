@@ -1,183 +1,289 @@
 """
 sim.py — Pseudo drone simulator for ISRO IoRC GCS
 ──────────────────────────────────────────────────
-Simulates a drone by publishing MQTT messages to the same broker
-as main.py. Run this in a second terminal alongside the GCS app.
+Behaviour:
+  · Starts PAUSED — press START on the GCS to begin telemetry
+  · Mode is set by the GCS mode buttons (MANUAL / WAYPOINT / AUTO)
+  · Responds to {"command":"START"} / {"command":"STOP"} on /uav/control
+  · Responds to {"mode":"X"} on /uav/control — updates published mode
 
 Usage:
-    python sim.py                          # telemetry only
-    python sim.py --image path/to/img.jpg  # telemetry + image
-    python sim.py --broker localhost        # custom broker
+    python sim.py                          # uses built-in test PNG
+    python sim.py --image path/to/img.jpg  # sends a real image
+    python sim.py --broker localhost
 """
 
-import argparse, base64, json, math, sys, time, struct, zlib, os
+import argparse, json, math, os, struct, time, zlib, threading
 import paho.mqtt.client as mqtt
 
-# ── Config ──────────────────────────────────────────────────
-TELEMETRY_TOPIC = "/uav/telemetry"
-IMAGE_TOPIC     = "/uav/image"
-CHUNK_SIZE      = 180          # bytes per image chunk (≤200 per spec)
-TELE_INTERVAL   = 1.0          # seconds between telemetry ticks
+# ── Frame / topic config ─────────────────────────────────────
+FRAME_DELIM  = b'\xAA\xBB\xCC'
+CHUNK_SIZE   = 180          # payload bytes ≤ 180 → total frame ≤ 200 B
+TELE_INTERVAL = 1.0
 
-# ── MQTT setup ──────────────────────────────────────────────
-def make_client(broker: str, port: int) -> mqtt.Client:
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.on_connect = lambda c, u, f, rc, p: print(
-        f"[SIM] Connected to {broker}:{port}" if rc == 0
-        else f"[SIM] Connect failed: {rc}"
-    )
-    client.connect(broker, port, 60)
-    client.loop_start()
-    return client
+TELE_TOPICS = {
+    "lat":      "/uav/lat",
+    "lng":      "/uav/lng",
+    "velocity": "/uav/velocity",
+    "altitude": "/uav/altitude",
+    "mode":     "/uav/mode",
+    "battery":  "/uav/battery",
+    "signal":   "/uav/signal",
+}
+IMAGE_TOPIC   = "/uav/image"
+CONTROL_TOPIC = "/uav/control"
 
-# ── Telemetry loop ──────────────────────────────────────────
-def run_telemetry(client: mqtt.Client, duration: float | None = None):
-    """
-    Publishes telemetry every TELE_INTERVAL seconds.
-    Simulates a drone flying in a square pattern (XY in metres).
-    battery drains 0.5 % per tick; signal oscillates 3-5.
-    """
-    t         = 0.0
-    battery   = 100.0
-    modes     = ["MANUAL", "WAYPOINT", "AUTO", "MANUAL"]
-    mode_idx  = 0
-    side      = 50.0          # 50 m square sides
-    speed     = 5.0           # m/s
 
-    print("[SIM] Starting telemetry stream… (Ctrl+C to stop)")
-    start = time.monotonic()
+# ── Frame helpers ────────────────────────────────────────────
 
-    while True:
-        # XY position: trace a square
-        cycle     = (speed * t) % (4 * side)
-        if   cycle < side:       x, y = cycle,            0.0
-        elif cycle < 2 * side:   x, y = side,             cycle - side
-        elif cycle < 3 * side:   x, y = side - (cycle - 2*side), side
-        else:                    x, y = 0.0,               side - (cycle - 3*side)
+def _varint(n: int) -> bytes:
+    for size in range(1, 5):
+        try:
+            return n.to_bytes(size, 'big')
+        except OverflowError:
+            continue
+    raise ValueError(f"Integer too large: {n}")
 
-        battery = max(0.0, battery - 0.5)
-        signal  = 3 + int(2 * abs(math.sin(t * 0.3)))    # 3-5
-        if int(t) % 30 == 0:                              # mode change every 30 s
-            mode_idx = (mode_idx + 1) % len(modes)
 
-        payload = {
-            "lat":      round(x, 3),
-            "lng":      round(y, 3),
-            "velocity": round(speed, 2),
-            "altitude": round(15.0 + 5.0 * math.sin(t * 0.2), 1),
-            "mode":     modes[mode_idx],
-            "battery":  int(battery),
-            "signal":   min(5, signal),
-        }
-        client.publish(TELEMETRY_TOPIC, json.dumps(payload), qos=1)
-        print(f"[SIM] tele → x={x:.1f} y={y:.1f} bat={int(battery)}% sig={signal} mode={modes[mode_idx]}")
+def make_frame(img_no: int, chunk_no: int, total: int, payload: bytes) -> bytes:
+    return (FRAME_DELIM + _varint(img_no)
+            + FRAME_DELIM + _varint(chunk_no)
+            + FRAME_DELIM + _varint(total)
+            + FRAME_DELIM + payload)
 
-        t += TELE_INTERVAL
-        if duration and (time.monotonic() - start) >= duration:
-            break
-        time.sleep(TELE_INTERVAL)
 
-# ── Test image generator (stdlib only) ─────────────────────
+# ── Test PNG generator ───────────────────────────────────────
+
 def generate_test_png(width: int = 120, height: int = 90) -> bytes:
-    """
-    Creates a valid PNG in-memory using only struct + zlib.
-    Draws a cyan/green gradient with a crosshair — no Pillow needed.
-    """
     def png_chunk(name: bytes, data: bytes) -> bytes:
-        raw   = name + data
-        crc   = zlib.crc32(raw) & 0xFFFFFFFF
-        return struct.pack(">I", len(data)) + raw + struct.pack(">I", crc)
-
+        raw = name + data
+        return struct.pack(">I", len(data)) + raw + struct.pack(">I", zlib.crc32(raw) & 0xFFFFFFFF)
     sig  = b"\x89PNG\r\n\x1a\n"
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-
     cx, cy = width // 2, height // 2
     raw = b""
     for y in range(height):
-        raw += b"\x00"   # filter byte
+        raw += b"\x00"
         for x in range(width):
-            # Gradient background
-            r = int(8  + 12  * x / width)
+            r = int(8 + 12 * x / width)
             g = int(13 + 180 * y / height)
             b = int(24 + 100 * x / width)
-            # Crosshair lines
             if abs(x - cx) <= 1 or abs(y - cy) <= 1:
                 r, g, b = 0, 212, 255
-            # Corner markers
             if (x < 8 or x > width - 9) and (y < 8 or y > height - 9):
                 r, g, b = 0, 255, 136
             raw += bytes([r, g, b])
-
-    idat = zlib.compress(raw, 6)
-    return (sig
-            + png_chunk(b"IHDR", ihdr)
-            + png_chunk(b"IDAT", idat)
+    return (sig + png_chunk(b"IHDR", ihdr)
+            + png_chunk(b"IDAT", zlib.compress(raw, 6))
             + png_chunk(b"IEND", b""))
 
 
 def resolve_image(path: str | None) -> bytes:
-    """Return image bytes from path, or auto-generate a test PNG."""
+    if path and os.path.isfile(path):
+        with open(path, "rb") as f:
+            return f.read()
     if path:
-        if not os.path.isfile(path):
-            print(f"[SIM] WARNING: '{path}' not found — generating test PNG instead")
-        else:
-            with open(path, "rb") as f:
-                return f.read()
-    print("[SIM] Generating built-in test PNG (120×90)…")
+        print(f"[SIM] WARNING: '{path}' not found — using generated PNG")
+    else:
+        print("[SIM] No image specified — using built-in test PNG (120×90)")
     return generate_test_png()
 
 
+# ── Simulator state ──────────────────────────────────────────
+
+class DroneSimulator:
+    """
+    Holds simulation state. Controlled externally by GCS via /uav/control.
+    Starts in STOPPED state — GCS must send START.
+    D-pad moves the drone 2 m per press (MANUAL mode only).
+    """
+
+    STEP = 2.0    # metres per D-pad press
+
+    def __init__(self):
+        self._running = False
+        self._mode    = "MANUAL"
+        self._dx      = 0.0      # accumulated D-pad X offset
+        self._dy      = 0.0      # accumulated D-pad Y offset
+        self._lock    = threading.Lock()
+
+    def handle_control(self, payload: bytes):
+        try:
+            data = json.loads(payload.decode())
+        except Exception:
+            return
+
+        cmd  = data.get("command", "")
+        mode = data.get("mode",    "")
+        move = data.get("move",    "")
+
+        with self._lock:
+            if cmd == "START":
+                self._running = True
+                print("[SIM] ▶ START received — telemetry running")
+            elif cmd == "STOP":
+                self._running = False
+                print("[SIM] ⏹ STOP received — telemetry paused")
+
+            if mode and mode in ("MANUAL", "WAYPOINT", "AUTO"):
+                self._mode = mode
+                print(f"[SIM] Mode → {self._mode}")
+
+            if move:
+                if self._mode == "MANUAL":
+                    if   move == "UP":    self._dy -= self.STEP
+                    elif move == "DOWN":  self._dy += self.STEP
+                    elif move == "LEFT":  self._dx -= self.STEP
+                    elif move == "RIGHT": self._dx += self.STEP
+                    print(f"[SIM] D-pad {move} → offset ({self._dx:.1f}, {self._dy:.1f}) m")
+                else:
+                    print(f"[SIM] D-pad ignored — not in MANUAL mode ({self._mode})")
+
+    def consume_offset(self) -> tuple[float, float]:
+        """Return and reset the pending D-pad position offset."""
+        with self._lock:
+            dx, dy = self._dx, self._dy
+            self._dx = self._dy = 0.0
+            return dx, dy
+
+    @property
+    def running(self):
+        with self._lock:
+            return self._running
+
+    @property
+    def mode(self):
+        with self._lock:
+            return self._mode
+
+
+# ── MQTT client ──────────────────────────────────────────────
+
+def make_client(broker: str, port: int, sim: DroneSimulator) -> mqtt.Client:
+    def on_connect(client, userdata, flags, rc, props):
+        if rc == 0:
+            print(f"[SIM] Connected to {broker}:{port}")
+            client.subscribe(CONTROL_TOPIC, qos=1)
+            print(f"[SIM] Subscribed to {CONTROL_TOPIC}")
+        else:
+            print(f"[SIM] Connect failed: {rc}")
+
+    def on_message(client, userdata, msg):
+        if msg.topic == CONTROL_TOPIC:
+            sim.handle_control(msg.payload)
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(broker, port, 60)
+    client.loop_start()
+    return client
+
+
+# ── Telemetry loop ───────────────────────────────────────────
+
+def run_telemetry(client: mqtt.Client, sim: DroneSimulator):
+    """
+    Publishes telemetry each second when running.
+    Waits (polls every 100 ms) when stopped.
+    XY traces a 50×50 m square. Battery drains only while running.
+    """
+    t        = 0.0
+    battery  = 100.0
+    side     = 50.0
+    speed    = 5.0
+
+    print("[SIM] Waiting for START from GCS…")
+
+    while True:
+        if not sim.running:
+            time.sleep(0.1)
+            continue
+
+        # XY square trace + manual D-pad offset
+        cycle = (speed * t) % (4 * side)
+        if   cycle < side:       x, y = cycle,                   0.0
+        elif cycle < 2 * side:   x, y = side,                    cycle - side
+        elif cycle < 3 * side:   x, y = side - (cycle - 2*side), side
+        else:                    x, y = 0.0,                      side - (cycle - 3*side)
+
+        dx, dy = sim.consume_offset()   # apply D-pad nudge
+        x = max(0.0, x + dx)
+        y = max(0.0, y + dy)
+
+        battery = max(0.0, battery - 0.3)
+        signal  = 3 + int(2 * abs(math.sin(t * 0.3)))
+        alt     = round(15.0 + 5.0 * math.sin(t * 0.2), 1)
+
+        fields = {
+            "lat":      str(round(x, 3)),
+            "lng":      str(round(y, 3)),
+            "velocity": str(speed),
+            "altitude": str(alt),
+            "mode":     sim.mode,
+            "battery":  str(int(battery)),
+            "signal":   str(min(5, signal)),
+        }
+
+        for key, topic in TELE_TOPICS.items():
+            client.publish(topic, fields[key], qos=1)
+
+        print(f"[SIM]  x={x:.1f}  y={y:.1f}  bat={int(battery)}%  "
+              f"sig={signal}  alt={alt}m  mode={sim.mode}")
+
+        t += TELE_INTERVAL
+        time.sleep(TELE_INTERVAL)
+
+
 # ── Image sender ─────────────────────────────────────────────
+
 def send_image(client: mqtt.Client, image_bytes: bytes, img_no: int = 1):
-    """
-    Splits image_bytes into CHUNK_SIZE-byte chunks and
-    publishes them one by one to /uav/image.
-    """
     total  = len(image_bytes)
     chunks = [image_bytes[i:i+CHUNK_SIZE] for i in range(0, total, CHUNK_SIZE)]
-    print(f"[SIM] Sending image — {total} bytes / {len(chunks)} chunks")
-
+    print(f"[SIM] Sending image — {total} B / {len(chunks)} chunks")
     for chunk_no, chunk in enumerate(chunks):
-        payload = {
-            "img_no":         img_no,
-            "chunk_no":       chunk_no,
-            "total_img_size": total,
-            "payload":        base64.b64encode(chunk).decode(),
-        }
-        client.publish(IMAGE_TOPIC, json.dumps(payload), qos=1)
-        print(f"[SIM] img chunk {chunk_no+1}/{len(chunks)}")
+        frame = make_frame(img_no, chunk_no, total, chunk)
+        client.publish(IMAGE_TOPIC, frame, qos=1)
+        print(f"[SIM] img chunk {chunk_no+1}/{len(chunks)} ({len(frame)} B)")
         time.sleep(0.01)
+    print("[SIM] Image send complete.")
 
-    print("[SIM] Image sending complete.")
 
-# ── Entry point ─────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description="ISRO IoRC Drone Simulator")
-    parser.add_argument("--broker", default="test.mosquitto.org", help="MQTT broker hostname")
-    parser.add_argument("--port",   default=1883, type=int,       help="MQTT broker port")
-    parser.add_argument("--image",  default=None,                 help="Path to image file to send")
-    parser.add_argument("--img-delay", default=5.0, type=float,   help="Seconds before sending image (default 5)")
+    parser.add_argument("--broker",    default="test.mosquitto.org")
+    parser.add_argument("--port",      default=1883, type=int)
+    parser.add_argument("--image",     default=None)
+    parser.add_argument("--img-delay", default=3.0, type=float,
+                        help="Seconds after START before sending image (default 3)")
     args = parser.parse_args()
 
-    client = make_client(args.broker, args.port)
-    time.sleep(1.5)   # wait for connection
+    sim    = DroneSimulator()
+    client = make_client(args.broker, args.port, sim)
+    time.sleep(1.5)
 
-    if args.image is not None or True:   # always send an image in sim mode
-        img_bytes = resolve_image(args.image)
-        import threading
-        def _delayed_image():
-            print(f"[SIM] Waiting {args.img_delay}s before sending image…")
-            time.sleep(args.img_delay)
-            send_image(client, img_bytes)
-        threading.Thread(target=_delayed_image, daemon=True).start()
+    img_bytes = resolve_image(args.image)
+
+    # Send image 3 s after drone starts (so GCS image viewer is already open)
+    def _img_thread():
+        while not sim.running:
+            time.sleep(0.2)
+        print(f"[SIM] Drone started — image in {args.img_delay}s…")
+        time.sleep(args.img_delay)
+        send_image(client, img_bytes)
+
+    threading.Thread(target=_img_thread, daemon=True).start()
 
     try:
-        run_telemetry(client)
+        run_telemetry(client, sim)
     except KeyboardInterrupt:
         print("\n[SIM] Stopped.")
     finally:
         client.loop_stop()
         client.disconnect()
+
 
 if __name__ == "__main__":
     main()
