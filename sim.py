@@ -30,8 +30,9 @@ TELE_TOPICS = {
     "battery":  "/uav/battery",
     "signal":   "/uav/signal",
 }
-IMAGE_TOPIC   = "/uav/image"
-CONTROL_TOPIC = "/uav/control"
+IMAGE_TOPIC    = "/uav/image"
+CONTROL_TOPIC  = "/uav/control"
+FAILSAFE_TOPIC = "/uav/failsafe"
 
 
 # ── Frame helpers ────────────────────────────────────────────
@@ -215,6 +216,16 @@ def run_telemetry(client: mqtt.Client, sim: DroneSimulator):
         signal  = 3 + int(2 * abs(math.sin(t * 0.3)))
         alt     = round(15.0 + 5.0 * math.sin(t * 0.2), 1)
 
+        # ── Failsafe logic ─────────────────────────
+        if battery < 20.0:
+            failsafe = "LOW_BATTERY"
+        elif 30 <= t < 38:           # simulated altitude breach at t=30s
+            failsafe = "ALTITUDE_BREACH"
+        elif 75 <= t < 80:           # simulated comms dropout at t=75s
+            failsafe = "COMM_TIMEOUT"
+        else:
+            failsafe = "NONE"
+
         fields = {
             "lat":      str(round(x, 3)),
             "lng":      str(round(y, 3)),
@@ -227,9 +238,11 @@ def run_telemetry(client: mqtt.Client, sim: DroneSimulator):
 
         for key, topic in TELE_TOPICS.items():
             client.publish(topic, fields[key], qos=1)
+        client.publish(FAILSAFE_TOPIC, failsafe, qos=1)
 
+        fs_disp = f"  ⚠ {failsafe}" if failsafe != "NONE" else ""
         print(f"[SIM]  x={x:.1f}  y={y:.1f}  bat={int(battery)}%  "
-              f"sig={signal}  alt={alt}m  mode={sim.mode}")
+              f"sig={signal}  alt={alt}m  mode={sim.mode}{fs_disp}")
 
         t += TELE_INTERVAL
         time.sleep(TELE_INTERVAL)

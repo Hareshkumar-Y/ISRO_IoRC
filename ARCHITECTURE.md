@@ -59,13 +59,24 @@ Each field has its **own dedicated topic**. Payload is a plain UTF-8 string (no 
 
 > QoS = 1 on all subscriptions (at-least-once delivery)
 
-### 3.2 Image — Drone → GCS
+### 3.2 Failsafe — Drone → GCS
+
+| Topic | Payload example | Description |
+|---|---|---|
+| `/uav/failsafe` | `"NONE"` | All clear — UI shows nothing |
+| `/uav/failsafe` | `"LOW_BATTERY"` | Battery below 20% |
+| `/uav/failsafe` | `"ALTITUDE_BREACH"` | Drone outside altitude bounds |
+| `/uav/failsafe` | `"COMM_TIMEOUT"` | Communication dropout detected |
+
+> Rule: if payload == `"NONE"` → no trace in UI. Any other string → blinking red warning banner.
+
+### 3.3 Image — Drone → GCS
 
 | Topic | Payload |
 |---|---|
 | `/uav/image` | Binary frame (see §4) |
 
-### 3.3 Control — GCS → Drone
+### 3.4 Control — GCS → Drone
 
 | Topic | Payload (JSON) | Trigger |
 |---|---|---|
@@ -197,13 +208,46 @@ After drone STARTs (3 s delay):
 
 ---
 
-## 8. GCS UI Layout
+## 8. Failsafe Data Flow
+
+```
+sim.py                               broker              main.py
+──────                               ──────              ───────
+
+Every telemetry tick:
+  Evaluate conditions:
+  ┌─ battery < 20%        → "LOW_BATTERY"
+  ├─ t ∈ [30 s, 38 s]    → "ALTITUDE_BREACH"   (simulated)
+  ├─ t ∈ [75 s, 80 s]    → "COMM_TIMEOUT"      (simulated)
+  └─ otherwise           → "NONE"
+
+  publish /uav/failsafe  ──────────────────────►  MQTTHandler._on_message()
+  e.g. "ALTITUDE_BREACH"                            emits failsafe_signal(str)
+
+                                                  DroneGCS._on_failsafe(msg)
+
+  if msg == "NONE":                               ┌─ hide FailsafeBar
+                                                  └─ stop blink timer
+
+  if msg != "NONE":                               ┌─ show FailsafeBar
+    e.g. "ALTITUDE_BREACH"                        ├─ set text: "FAILSAFE — ALTITUDE_BREACH"
+                                                  ├─ set timestamp: "10:09:57"
+                                                  └─ start blink timer (400 ms)
+                                                       alternates #4A0000 ↔ #2A0000
+```
+
+---
+
+## 9. GCS UI Layout
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ◈  GCS | ISRO IoRC 2026              ● CONNECTED        ─   ✕      │  ← Title bar
 ├──────────────────────────────────────────────────────────────────────┤
 │  🕹 MANUAL    📍 WAYPOINT    🤖 AUTO                                  │  ← Mode bar
+├──────────────────────────────────────────────────────────────────────┤
+│  ⚠  FAILSAFE — ALTITUDE_BREACH                          10:09:57    │  ← Failsafe bar
+│     (blinking red, hidden when NONE)                                 │    (hidden by default)
 ├─────────────┬────────────────────────────────┬───────────────────────┤
 │             │  ● DRONE STATUS: MANUAL        │  BATTERY              │
 │  CONTROL    │                                │  [████████░] 84%      │
@@ -218,35 +262,39 @@ After drone STARTs (3 s delay):
 │             │  │   (received drone image) │  │  ▶ START             │
 │             │  └──────────────────────────┘  │                       │
 ├─────────────┴────────────────────────────────┴───────────────────────┤
-│  DIST  0.0 m    AREA  0.0 m²          MISSION ACTIVE     09:48 IST  │  ← Status bar
+│  DIST  0.0 m    AREA  0.0 m²          MISSION ACTIVE     10:13 IST  │  ← Status bar
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 9. File Structure
+## 10. File Structure
 
 ```
 ISRO_IoRC/
-├── main.py          — GCS application (PyQt6 UI + MQTT backend)
-├── sim.py           — Drone simulator (publishes telemetry + images)
-├── main_ref.py      — Original reference implementation
-├── DroneGCS.spec    — PyInstaller spec file
+├── main.py           — GCS application (PyQt6 UI + MQTT backend)
+├── sim.py            — Drone simulator (publishes telemetry + images)
+├── ARCHITECTURE.md   — This document
+├── main_ref.py       — Original reference implementation
+├── DroneGCS.spec     — PyInstaller spec file
 ├── dist/
-│   └── DroneGCS.exe — Standalone executable
-└── gcs_log_*.csv    — Telemetry logs (auto-generated per session)
+│   └── DroneGCS.exe  — Standalone executable
+└── gcs_log_*.csv     — Telemetry logs (auto-generated per session)
 ```
 
 ---
 
-## 10. Key Design Decisions
+## 11. Key Design Decisions
 
 | Decision | Rationale |
 |---|---|
 | **Per-field MQTT topics** | Allows the drone to publish only changed fields; GCS accumulates state across topics |
 | **Binary image frame** | No JSON/base64 overhead — raw bytes stay within 200 B frame limit |
+| **Failsafe as plain string** | Simple to parse; `"NONE"` = all clear, anything else = active fault |
+| **Failsafe bar hidden by default** | Zero visual noise when all is well; appears and blinks only on fault |
 | **Sim starts paused** | Drone does nothing until GCS operator explicitly sends START — safe default |
 | **Mode feedback loop fix** | `_apply_mode()` updates UI only; `set_mode()` publishes — prevents infinite publish loop |
+| **D-pad MANUAL-only** | Autonomous modes ignore manual movement commands for safety |
 | **60 s chunk timeout** | Public broker is slow; 60 s gives enough headroom for large images |
 | **DataLogger to CSV** | Every telemetry tick is recorded for post-mission analysis |
 | **Frameless PyQt6 window** | Clean cockpit aesthetic; custom title bar with drag support |

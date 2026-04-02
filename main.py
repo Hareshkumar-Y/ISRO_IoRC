@@ -156,7 +156,8 @@ class MissionManager(QObject):
 class MQTTHandler(QObject):
     telemetry_signal   = pyqtSignal(dict)
     image_signal       = pyqtSignal(bytes)
-    connection_signal  = pyqtSignal(bool)   # True = connected
+    connection_signal  = pyqtSignal(bool)
+    failsafe_signal    = pyqtSignal(str)    # emits failsafe message or "NONE"
 
     BROKER = "test.mosquitto.org"
     PORT   = 1883
@@ -212,7 +213,8 @@ class MQTTHandler(QObject):
             # Subscribe to each telemetry field topic individually
             for topic in self.TELE_TOPICS:
                 client.subscribe(topic, qos=1)
-            client.subscribe("/uav/image", qos=1)
+            client.subscribe("/uav/image",    qos=1)
+            client.subscribe("/uav/failsafe", qos=1)
             self.connection_signal.emit(True)
         else:
             print(f"[MQTT] Connect refused: {reason_code}")
@@ -247,6 +249,15 @@ class MQTTHandler(QObject):
                 pass
             except Exception as e:
                 print(f"[MQTT] Telemetry parse error ({topic}): {e}")
+
+        # ── Failsafe ──────────────────────────────────────
+        elif topic == "/uav/failsafe":
+            try:
+                self.failsafe_signal.emit(msg.payload.decode().strip())
+            except RuntimeError:
+                pass
+            except Exception as e:
+                print(f"[MQTT] Failsafe parse error: {e}")
 
         # ── Binary image frame ───────────────────────────
         elif topic == "/uav/image":
@@ -460,6 +471,7 @@ class DroneGCS(QMainWindow):
         self.mqtt.telemetry_signal.connect(self._on_telemetry)
         self.mqtt.image_signal.connect(self._on_image)
         self.mqtt.connection_signal.connect(self._on_connection)
+        self.mqtt.failsafe_signal.connect(self._on_failsafe)
         self.tele_p.stats_signal.connect(self._on_stats)
 
         self._current_mode = "MANUAL"
@@ -501,6 +513,7 @@ class DroneGCS(QMainWindow):
         rl.setSpacing(0)
         rl.addWidget(self._build_titlebar())
         rl.addWidget(self._build_modebar())
+        rl.addWidget(self._build_failsafe_banner())   # hidden until triggered
         body = QHBoxLayout()
         body.setContentsMargins(12, 8, 12, 8)
         body.setSpacing(10)
@@ -538,6 +551,46 @@ class DroneGCS(QMainWindow):
         self._mode_btns["MANUAL"].setChecked(True)
         h.addStretch()
         return bar
+
+    def _build_failsafe_banner(self):
+        """Full-width warning bar — hidden when all clear, blinking when failsafe active."""
+        self._fs_bar = QWidget()
+        self._fs_bar.setObjectName("FailsafeBar")
+        self._fs_bar.setFixedHeight(44)
+        self._fs_bar.hide()
+
+        h = QHBoxLayout(self._fs_bar)
+        h.setContentsMargins(20, 0, 20, 0)
+        h.setSpacing(12)
+
+        icon = QLabel("⚠")
+        icon.setObjectName("FailsafeIcon")
+
+        self._fs_text = QLabel("FAILSAFE ACTIVE")
+        self._fs_text.setObjectName("FailsafeText")
+
+        self._fs_time = QLabel("")
+        self._fs_time.setObjectName("FailsafeTime")
+
+        h.addWidget(icon)
+        h.addWidget(self._fs_text)
+        h.addStretch()
+        h.addWidget(self._fs_time)
+
+        # Blink timer
+        self._fs_blink_on = True
+        self._fs_blink_timer = QTimer(self)
+        self._fs_blink_timer.timeout.connect(self._blink_failsafe)
+
+        return self._fs_bar
+
+    def _blink_failsafe(self):
+        self._fs_blink_on = not self._fs_blink_on
+        color = "#4A0000" if self._fs_blink_on else "#2A0000"
+        self._fs_bar.setStyleSheet(
+            f"#FailsafeBar {{ background-color: {color}; "
+            f"border-bottom: 2px solid #FF3322; }}"
+        )
 
     def _build_left_panel(self):
         panel = GlassPanel(accent="#00D4FF"); panel.setFixedWidth(220)
@@ -695,6 +748,19 @@ class DroneGCS(QMainWindow):
         self.tele_p.process(x, y)
         self.logger.log(data)
 
+    def _on_failsafe(self, msg: str):
+        if msg.upper() == "NONE" or msg == "":
+            self._fs_bar.hide()
+            self._fs_blink_timer.stop()
+        else:
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._fs_text.setText(f"FAILSAFE — {msg}")
+            self._fs_time.setText(ts)
+            self._fs_bar.show()
+            if not self._fs_blink_timer.isActive():
+                self._fs_blink_timer.start(400)
+            print(f"[FAILSAFE] {msg} @ {ts}")
+
     def _on_stats(self, dist_m: float, area_m2: float):
         self._dist_lbl.setText(f"DIST  {dist_m:.1f} m")
         self._area_lbl.setText(f"AREA  {area_m2:.1f} m²")
@@ -850,6 +916,10 @@ class DroneGCS(QMainWindow):
 #StatusBar { background-color: #0A1020; border-top: 1px solid #121e30; }
 #BarItem      { color: #304560; font-size: 11px; font-weight: bold; letter-spacing: 1px; }
 #MissionLabel { color: #00FF88; font-size: 10px; font-weight: bold; letter-spacing: 3px; }
+#FailsafeBar  { background-color: #3D0000; border-bottom: 2px solid #FF3322; }
+#FailsafeIcon { color: #FF4444; font-size: 22px; }
+#FailsafeText { color: #FF4444; font-size: 13px; font-weight: bold; letter-spacing: 2px; }
+#FailsafeTime { color: #FF8866; font-size: 11px; }
         """)
 
 
